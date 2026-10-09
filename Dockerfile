@@ -13,6 +13,5 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY main.py .
 COPY ntfy.py .
-COPY config.json .
 
 CMD ["python", "main.py"]
