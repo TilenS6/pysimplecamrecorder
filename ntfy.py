@@ -31,7 +31,7 @@ class NtfyNotifier:
         )
 
         if not response.ok:
-            raise RuntimeError(
+            print(
                 f"ntfy request failed ({response.status_code}): {response.text}"
             )
 

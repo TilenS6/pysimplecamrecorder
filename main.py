@@ -198,29 +198,51 @@ class CameraRecorder:
     def run(self) -> None:
         self.camera_dir.mkdir(parents=True, exist_ok=True)
         output_pattern = str(self.camera_dir / "%Y-%m-%d_%H-%M-%S.mkv")
+        last_time_errored = False
         while not self.stop_event.is_set():
             process: subprocess.Popen[bytes] | None = None
             try:
+                start_time = time()
                 process = subprocess.Popen(
                     self._build_command(output_pattern),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                
                 while process.poll() is None and not self.stop_event.wait(1):
+                    if last_time_errored and time() - start_time >= 30:
+                        message = f"Recorder for {self.camera.name} restarted successfully"
+                        LOGGER.warning(message)
+                        notify_error(self.notify, message)
+                        last_time_errored = False
+
                     pass
                 if self.stop_event.is_set() and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=10)
                     return
-                exit_code = process.returncode
-                message = f"Recorder for {self.camera.name} stopped (exit code {exit_code})"
-                LOGGER.warning(message)
-                notify_error(self.notify, message)
+                
+                if not last_time_errored:
+                    message = ""
+                    exit_code = process.returncode
+
+                    if exit_code == 143: # no route to host
+                        message = f"Camera \"{self.camera.name}\" is offline, trying to reconect"
+                    elif exit_code == 145:
+                        message = f"Ffmpeg connection to \"{self.camera.name}\" refused, trying to reconect"
+                    else:
+                        message = f"Ffmpeg for \"{self.camera.name}\" exited with code {exit_code}, trying to restart"
+
+                    LOGGER.warning(message)
+                    notify_error(self.notify, message)
+                    last_time_errored = True
+
             except FileNotFoundError:
                 message = "ffmpeg was not found; install ffmpeg and restart the recorder"
                 LOGGER.error(message)
                 notify_error(self.notify, message)
                 return
+            
             except Exception as error:
                 LOGGER.exception("Recorder for %s failed", self.camera.name)
                 notify_error(self.notify, f"Recorder for {self.camera.name} failed: {error}")
