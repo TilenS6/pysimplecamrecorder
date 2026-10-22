@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import signal
 import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from time import time
+from time import *
 from typing import Any
 
 from ntfy import NtfyNotifier
@@ -134,7 +135,7 @@ class StorageCleaner:
 
     def collect_if_needed(self) -> int:
         used_percent = self._disk_usage_percent()
-        print(f"Disk usage: {used_percent:.2f}%")
+        #print(f"Disk usage: {used_percent:.2f}%")
         if used_percent < self.config.delete_at_percent:
             return 0
 
@@ -145,7 +146,7 @@ class StorageCleaner:
             try:
                 path.unlink()
                 deleted += 1
-                LOGGER.info("Deleted old recording %s", path)
+                #LOGGER.info("Deleted old recording %s", path)
             except FileNotFoundError:
                 continue
             except OSError as error:
@@ -168,11 +169,59 @@ class StorageCleaner:
             resolved = path.resolve()
             if resolved == root or root not in resolved.parents:
                 continue
-            print(resolved.stat().st_mtime - time())
+            #print(resolved.stat().st_mtime - time())
             if time() - resolved.stat().st_mtime > 60*60: # only delete files older than 1 hour
                 files.append(resolved)
         return sorted(files, key=lambda path: path.stat().st_mtime)
 
+# Monitor newest file modification time in certain directory, trigger event if no modification for a certain time
+class FileWatchdog:
+    def __init__(self, path: Path, stop_event: threading.Event, timeout: float, trigger_function: function):
+        self.path = path
+        self.stop_event = stop_event
+        self.timeout = timeout
+        self.trigger_function = trigger_function
+
+    def _get_mtime(self) -> float:
+        try:
+            root = self.path.resolve()
+            newest_mtime = 0.0
+            directories = [os.fspath(root)]
+            while directories:
+                with os.scandir(directories.pop()) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(entry.path)
+                            continue
+                        if not entry.is_file():
+                            continue
+                        if entry.is_symlink():
+                            resolved = Path(os.path.realpath(entry.path))
+                            if resolved == root or root not in resolved.parents:
+                                continue
+                        newest_mtime = max(newest_mtime, entry.stat().st_mtime)
+            return newest_mtime
+        except FileNotFoundError:
+            return 0
+        except OSError as error:
+            LOGGER.warning("Could not get modification time for %s: %s", self.path, error)
+            return 0
+        except Exception as error:
+            LOGGER.exception("Unexpected error while getting modification time for %s", self.path)
+            return 0
+
+    def run(self) -> None:
+        #print(f"Starting watchdog for {self.path} with timeout {self.timeout} seconds")
+        while not self.stop_event.is_set():
+            current_mtime = self._get_mtime()
+            #print(time() - current_mtime)
+            if time() - current_mtime > self.timeout:
+                #LOGGER.warning("No modification for %s in %s seconds, triggering function", self.path, self.timeout)
+                try:
+                    self.trigger_function()
+                except Exception as error:
+                    LOGGER.exception("Error while executing trigger function for %s: %s", self.path, error)
+            sleep(10)
 
 def notify_error(notifier: NtfyNotifier, message: str) -> None:
     try:
@@ -194,37 +243,45 @@ class CameraRecorder:
         self.stop_event = stop_event
         self.notify = notify
         self.camera_dir = config.output_dir / camera.name
+        self.watchdog = FileWatchdog(self.camera_dir, stop_event, 60, self._on_no_modification)
+        self.record_process = None
+        self.watchdog_thread = None
+        self.last_time_errored = False
+        self.last_restart = 0
+        self.process_start_time = 0
 
     def run(self) -> None:
         self.camera_dir.mkdir(parents=True, exist_ok=True)
         output_pattern = str(self.camera_dir / "%Y-%m-%d_%H-%M-%S.mkv")
-        last_time_errored = False
+        self.last_time_errored = False
+        self._start_watchdog_paralel()
         while not self.stop_event.is_set():
-            process: subprocess.Popen[bytes] | None = None
+            self.record_process: subprocess.Popen[bytes] | None = None
             try:
-                start_time = time()
-                process = subprocess.Popen(
+                self.process_start_time = time()
+                self.record_process = subprocess.Popen(
                     self._build_command(output_pattern),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
                 )
                 
-                while process.poll() is None and not self.stop_event.wait(1):
-                    if last_time_errored and time() - start_time >= 30:
-                        message = f"Recorder for {self.camera.name} restarted successfully"
+                while self.record_process.poll() is None and not self.stop_event.wait(1):
+                    if self.last_time_errored and time() - self.process_start_time >= 35:
+                        message = f"Recording for \"{self.camera.name}\" is steady."
                         LOGGER.warning(message)
                         notify_error(self.notify, message)
-                        last_time_errored = False
+                        self.last_time_errored = False
 
-                    pass
-                if self.stop_event.is_set() and process.poll() is None:
-                    process.terminate()
-                    process.wait(timeout=10)
+                if self.stop_event.is_set() and self.record_process.poll() is None:
+                    self.record_process.terminate()
                     return
+
+                recorder_output = "\n".join(self.record_process.stdout.readlines()) + "\n" + "\n".join(self.record_process.stderr.readlines())
                 
-                if not last_time_errored:
+                if not self.last_time_errored:
                     message = ""
-                    exit_code = process.returncode
+                    exit_code = self.record_process.returncode
 
                     if exit_code == 143: # no route to host
                         message = f"Camera \"{self.camera.name}\" is offline, trying to reconect"
@@ -233,9 +290,10 @@ class CameraRecorder:
                     else:
                         message = f"Ffmpeg for \"{self.camera.name}\" exited with code {exit_code}, trying to restart"
 
-                    LOGGER.warning(message)
-                    notify_error(self.notify, message)
-                    last_time_errored = True
+                    if time() - self.last_restart >= 60:
+                        LOGGER.warning(message + f"\n{recorder_output}")
+                        notify_error(self.notify, message)
+                    self.last_time_errored = True
 
             except FileNotFoundError:
                 message = "ffmpeg was not found; install ffmpeg and restart the recorder"
@@ -244,10 +302,44 @@ class CameraRecorder:
                 return
             
             except Exception as error:
-                LOGGER.exception("Recorder for %s failed", self.camera.name)
-                notify_error(self.notify, f"Recorder for {self.camera.name} failed: {error}")
+                LOGGER.exception("Recorder for \"%s\" failed", self.camera.name)
+                notify_error(self.notify, f"Recorder for \"{self.camera.name}\" failed: {error}")
             if not self.stop_event.wait(5):
                 continue
+          
+    def _start_watchdog_paralel(self) -> None:
+        def watchdog_thread_func():
+            while self.record_process is None or self.stop_event.is_set():
+                sleep(1)
+            
+            self.watchdog_thread = threading.Thread(
+                target=self.watchdog.run,
+                name=f"watchdog-{self.camera.name}",
+                daemon=True,
+            )
+            self.last_restart = time()
+            self.watchdog_thread.start()
+        
+        self.watchdog_thread = threading.Thread(
+            target=watchdog_thread_func,
+            name=f"watchdog-starter-{self.camera.name}",
+            daemon=True,
+        )
+        self.watchdog_thread.start()
+      
+    def _on_no_modification(self) -> None:
+        if self.stop_event.is_set(): return
+        if time() - self.last_restart < 60: return # wait at least 60 seconds before restarting this routine
+        if time() - self.process_start_time < 35: return # wait at least 35 seconds before restarting, to avoid restarting process too quickly
+        self.last_restart = time()
+        
+        if not self.last_time_errored:
+            message = f"Watchdog for \"{self.camera.name}\" triggered, restarting recorder..."
+            LOGGER.warning(message)
+            notify_error(self.notify, message)
+        if self.record_process and self.record_process.poll() is None:
+            self.record_process.terminate()
+            self.record_process.wait(timeout=10)
 
     def _build_command(self, output_pattern: str) -> list[str]:
         return [
